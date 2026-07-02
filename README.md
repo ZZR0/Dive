@@ -2,145 +2,293 @@
 
 **D**ivergence-directed, **I**ntent-grounded patch **V**alidation through **E**xploration
 
-DIVE is an automated technique for detecting unintended behavioral changes in pull requests (PRs). It compares the natural-language intent of a PR against the behavioral difference that the patch produces: an executable *patch oracle* is inferred from the PR description, and DIVE searches for inputs that reach the changed code and expose pre/post differences. Each exposed difference is then classified as intended or a regression.
+DIVE detects unintended behavioral changes in pull requests (PRs). It builds on the [PatchGuru](PatchGuru/) pipeline: Phase 1 infers an executable *patch oracle* from the PR description; Phase 2 (DIVE) searches for inputs that reach the changed code, expose pre/post differences, and classifies each difference as intended or a regression.
 
-This repository contains the DIVE implementation, evaluation artifacts, and the ICSE 2027 research-track paper draft.
+Supported target projects: **pandas**, **scipy**, **keras**, **marshmallow**.
 
-## Motivation
+> **Scope:** Each PR must modify a **single source function** (test-only changes are not supported).
 
-Patches that fix one behavior can unintentionally change another. Existing intent-based detectors (e.g., [PatchGuru](PatchGuru/), [Testora](Testora/)) generate test inputs by querying a language model once for a small static set of inputs. That one-shot strategy often misses regressions—especially for APIs whose functions take structured domain objects (dataframes, tensors, schema instances), where the specific input that triggers a side effect is hard to guess.
+## Prerequisites
 
-DIVE separates **input discovery** from **intent judgment**:
+| Requirement | Notes |
+|-------------|-------|
+| Docker | Runs target projects in isolated containers |
+| Python 3.11+ | PatchGuru uses [uv](https://github.com/astral-sh/uv) (`uv run`) |
+| OpenAI API key | File `PatchGuru/.openai_token` (one line, the key) |
+| GitHub API token | File `PatchGuru/.github_token` (for fetching PR diffs) |
+| Network / proxy | Optional; see [Proxy](#proxy) below |
 
-| Task | Mechanism |
-|------|-----------|
-| Reach changed code and produce pre/post differences | Divergence-directed search over many candidate inputs (cheap containerized executions) |
-| Decide whether a difference is intended | LLM reviewer using the PR description and patch oracle |
+Install `uv` if needed:
 
-## Key Results
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
-Evaluated on **703 merged PRs** from four Python libraries (pandas, scipy, keras, marshmallow), compared against PatchGuru and Testora:
+## Quick Start
 
-| Tool | True bugs | Precision |
-|------|-----------|-----------|
-| **DIVE** | **51** | **79.7%** |
-| PatchGuru | 35 | 68.6% |
-| Testora | 7 | 41.2% |
+### 1. Configure API tokens
 
-DIVE achieves these results at roughly **half the LLM cost** of PatchGuru (~$0.033 vs. ~$0.070 per PR) and similar end-to-end time (~4.6 min/PR), because additional inputs are explored with executions rather than extra model queries.
+```bash
+cd PatchGuru
+echo "sk-..." > .openai_token
+echo "ghp_..." > .github_token
+chmod 600 .openai_token .github_token
+```
 
-## How DIVE Works
+Testora reads the same tokens (via symlinks or copies in `Testora/`).
 
-DIVE runs as **Phase 2** of the PatchGuru pipeline (after Phase 1 oracle inference). The pipeline has five steps:
+### 2. Build target-project environments
 
-1. **Seed extraction** — Collect candidate inputs from PR tests, docstrings, and the synthesized oracle.
-2. **Structured input construction** — Build valid domain objects via type-driven strategies and LLM-generated generators; mutate at boundaries, types, and shapes.
-3. **Divergence-directed search** — Score inputs by reaching changed lines and producing new pre/post differences; run differential execution in Docker.
-4. **Triage** — Cluster raw differences, minimize representatives, and drop flaky ones.
-5. **Intent classification** — LLM classifies each minimized difference as intended or a bug.
+Clone directories are created next to this repo at `../clones/` (i.e. sibling of `PatchGuru/`). Run once per project:
 
-Core implementation:
+```bash
+cd PatchGuru
+bash scripts/setup_env.sh pandas     # repeat for scipy / keras / marshmallow
+```
 
-| Module | Path |
-|--------|------|
-| Orchestrator | `PatchGuru/patchguru/analysis/DivergenceSearch.py` |
-| Input constructor | `PatchGuru/patchguru/analysis/InputConstructor.py` |
-| In-container search harness | `PatchGuru/patchguru/analysis/dive_harness.py` |
-| Phase 2 switch | `PatchGuru/patchguru/Config.py` (`PHASE2_STRATEGY`) |
+This clones the project, installs dependencies inside Docker, and commits a reusable image `patchguru-<project>-dev`.
+
+### 3. Scale parallel workers
+
+```bash
+NB_CLONES=10 bash scripts/expand_clones.sh pandas
+```
+
+Repeat for each project you plan to analyze. Each clone gets its own long-running container (`patchguru-<project>-dev-<id>`).
+
+### 4. Run DIVE on one PR
+
+```bash
+cd PatchGuru
+
+PATCHGURU_PHASE2_STRATEGY=dive \
+  uv run python -m patchguru.SpecInfer --project marshmallow --pr_nb 707
+```
+
+Re-run from scratch (ignore cache):
+
+```bash
+PATCHGURU_PHASE2_STRATEGY=dive \
+  uv run python -m patchguru.SpecInfer --project marshmallow --pr_nb 707 --force
+```
+
+## Batch Runs
+
+### DIVE (recommended entry point)
+
+After containers are ready:
+
+```bash
+cd PatchGuru
+
+NB_CLONES=10 WORKERS=10 \
+  PATCHGURU_PHASE2_STRATEGY=dive \
+  bash scripts/watch_and_run.sh pandas scipy keras marshmallow
+```
+
+Or call the scheduler directly:
+
+```bash
+cd PatchGuru
+
+uv run python scripts/run_all_specinfer.py \
+  --projects pandas scipy keras marshmallow \
+  --workers 10 --nb-clones 10 \
+  --timeout 2400 \
+  --phase2-strategy dive \
+  --cache-dir .cache_dive
+```
+
+Run a custom PR list (one line per PR: `<project> <pr_nb>`):
+
+```bash
+uv run python scripts/run_all_specinfer.py \
+  --pr-file scripts/pr_batch_300/new200.txt \
+  --phase2-strategy dive \
+  --workers 10 --nb-clones 10 \
+  --cache-dir .cache_dive
+```
+
+Resume without re-running finished PRs: omit `--force`. Completed PRs (`stage: completed`) are skipped automatically.
+
+Convenience wrapper (prepares PR list from a baseline cache, then runs DIVE Phase 2):
+
+```bash
+cd PatchGuru
+PR_FILE=scripts/pr_batch_300/new200.txt \
+  BASELINE_CACHE=.cache_baseline \
+  DIVE_CACHE=.cache_dive \
+  bash scripts/run_dive.sh
+```
+
+### PatchGuru baseline (one-shot Phase 2)
+
+Same setup; omit `--phase2-strategy dive` (default is `baseline`):
+
+```bash
+cd PatchGuru
+uv run python scripts/run_all_specinfer.py \
+  --projects pandas scipy keras marshmallow \
+  --workers 10 --nb-clones 10 \
+  --cache-dir .cache_baseline
+```
+
+Or use the helper script:
+
+```bash
+bash scripts/run_baseline.sh
+```
+
+### Testora baseline
+
+Testora lives in [`Testora/`](Testora/). Set up a venv and reuse the clone pool under `../clones/`:
+
+```bash
+cd Testora
+python -m venv .venv && .venv/bin/pip install -r requirements.txt
+
+# Single PR
+.venv/bin/python -m testora.RegressionFinder --project scipy --pr 21768
+
+# Batch on the shared new200 benchmark (703 PRs)
+bash scripts/run_testora.sh
+```
+
+Inspect results in the Web UI:
+
+```bash
+.venv/bin/python -m testora.webui.WebUI --files .results_new200/logs/*.json
+# open http://localhost:4000/
+```
+
+## Pipeline Overview
+
+Each PR goes through two phases in PatchGuru/DIVE:
+
+| Phase | What it does |
+|-------|----------------|
+| **Phase 1** | Intent analysis → oracle synthesis → self-review |
+| **Phase 2** | **Baseline:** LLM generates a few static inputs. **DIVE:** seed extraction → input construction → divergence-directed search → triage → intent classification |
+
+Phase 2 runs only when Phase 1 concludes `NORMAL`. Final labels:
+
+| `review_conclusion` | Meaning |
+|---------------------|---------|
+| `BUG` | Behavioral change inconsistent with PR intent |
+| `NORMAL` | Consistent with intent |
+| `MISMATCH` | Generated test/oracle is invalid |
+
+DIVE Phase 2 steps (implementation in `PatchGuru/patchguru/analysis/`):
+
+1. **Seed extraction** — PR tests, docstrings, Phase 1 oracle calls
+2. **Input construction** — `InputConstructor.py`: type-driven strategies + LLM generators
+3. **Divergence-directed search** — `dive_harness.py`: fitness-guided input exploration in Docker
+4. **Triage** — cluster, minimize, deflake divergences
+5. **Intent classification** — LLM reviews each minimized difference
+
+## Configuration
+
+Environment variables (defaults in `PatchGuru/patchguru/Config.py`):
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `PATCHGURU_PHASE2_STRATEGY` | `baseline` | Set to `dive` to enable DIVE |
+| `PATCHGURU_CACHE_DIR` | `.cache_rerun` | Output directory (overridden by `--cache-dir`) |
+| `PATCHGURU_DIVE_EXEC_BUDGET` | `800` | Max function executions per PR |
+| `PATCHGURU_DIVE_TIME_BUDGET_SEC` | `300` | Wall-clock search budget inside container |
+| `PATCHGURU_DIVE_DEFLAKE_K` | `3` | Repeats to drop flaky divergences |
+| `PATCHGURU_DIVE_MAX_CLUSTERS` | `8` | Max divergence clusters to classify |
+| `PATCHGURU_DIVE_SEED_BASELINE_DIR` | — | Baseline cache for seed fusion |
+| `PATCHGURU_DIVE_ABLATION` | `none` | `no_constructor`, `no_guided`, `no_triage`, `search_only` |
+| `PATCHGURU_NB_CLONES` | `3` | Clone pool size (scripts usually set `10`) |
+| `PATCHGURU_CLONE_ID` | — | Pin a single clone (debugging) |
+
+Ablation experiments:
+
+```bash
+PATCHGURU_DIVE_ABLATION=no_constructor bash scripts/run_ablation.sh
+```
+
+### Proxy
+
+If you need a proxy for `git clone` or GitHub API access:
+
+| Variable | Purpose | Typical value |
+|----------|---------|---------------|
+| `GIT_PROXY` | Host-side git fetch | `socks5h://127.0.0.1:10808` |
+| `PATCHGURU_HOST_PROXY` | PyGithub / HTTP requests | same as `GIT_PROXY` |
+| `CONTAINER_PROXY` | pip/build inside containers | `http://host.docker.internal:10810` |
+
+Batch scripts inject `http_proxy` / `PATCHGURU_HOST_PROXY` into child processes when set.
+
+## Outputs
+
+After a run, results live under `<cache-dir>/oracles/<project>/<pr>/`:
+
+| File | Content |
+|------|---------|
+| `results.json` | Phase 1 result (`review_conclusion`, LLM usage, stage) |
+| `phase2/results.json` | Phase 2 result (DIVE search stats + conclusion) |
+| `specification.py` | Generated oracle test code |
+| `phase2/specification.py` | Phase 2 test driver |
+
+Batch progress:
+
+| Path | Content |
+|------|---------|
+| `scripts/run_all_progress.jsonl` | One JSON line per PR |
+| `scripts/logs/*.log` | Batch stdout |
+| `logs/<project>/<clone_id>/<session>/events.log` | Per-PR event trace |
+
+Summarize a cache directory:
+
+```bash
+cd PatchGuru
+uv run python scripts/summarize_results.py --cache-dir .cache_dive
+bash scripts/summarize_results.sh .cache_dive    # shell wrapper
+```
+
+Compare DIVE vs baseline:
+
+```bash
+uv run python scripts/compare_baseline_dive.py \
+  --baseline-cache .cache_baseline --dive-cache .cache_dive
+```
 
 ## Repository Layout
 
 ```
 .
-├── PatchGuru/          # DIVE implementation (extends PatchGuru Phase 2)
-│   ├── patchguru/      # Core analysis pipeline
-│   └── scripts/        # Batch runners, Docker clone setup, evaluation
-├── Testora/            # Baseline comparison tool (vendored)
-├── paper/              # ICSE 2027 LaTeX draft and experiment notes
-│   ├── main.tex
-│   └── experiment-status.md   # Source of truth for evaluation numbers
-├── clones/             # Target-project git clones for Docker workers (generated)
-└── clones_pgabl/       # Additional clone pool (generated)
+├── PatchGuru/              # DIVE + PatchGuru pipeline
+│   ├── patchguru/          # Core Python package
+│   │   └── analysis/       # DivergenceSearch, InputConstructor, dive_harness
+│   ├── scripts/            # setup, batch runners, evaluation helpers
+│   └── .devcontainer/      # Optional VS Code Dev Container setup
+├── Testora/                # Testora baseline (comparison)
+├── clones/                 # Target-project clones (generated by setup_env.sh)
+└── clones_pgabl/           # Additional clone pool (generated)
 ```
 
-## Getting Started
+PR benchmark lists: `PatchGuru/scripts/pr_batch_300/` (e.g. `new200.txt` — 703 PRs across four libraries).
 
-DIVE builds on [PatchGuru](PatchGuru/). See [PatchGuru/README.md](PatchGuru/README.md) for environment setup (Docker, API tokens, target projects).
+Further details: [PatchGuru/README.md](PatchGuru/README.md), [PatchGuru/scripts/README.md](PatchGuru/scripts/README.md), [Testora/README.md](Testora/README.md).
 
-### Prerequisites
+## Troubleshooting
 
-- Docker
-- Python 3.11+ with [uv](https://github.com/astral-sh/uv) (PatchGuru uses `uv run`)
-- OpenAI API key (`.openai_token` in `PatchGuru/`)
-- GitHub API token (`.github_token` in `PatchGuru/`)
+| Symptom | Fix |
+|---------|-----|
+| `git clean` permission denied after container runs | `bash PatchGuru/scripts/fix_clone_permissions.sh` |
+| keras checkout: `reference is not a tree` | `bash PatchGuru/scripts/fix_keras_clones.sh` |
+| marshmallow: duplicate `marshmallow/` paths | `bash PatchGuru/scripts/fix_marshmallow_clones.sh` |
+| scipy needs full clone rebuild | `FORCE_REFRESH=1 NB_CLONES=10 bash scripts/expand_clones.sh scipy` |
+| Batch shows `✓ done` but no `results.json` | Analysis exited early; check `events.log` |
+| Stale logs in terminal | Set `PYTHONUNBUFFERED=1` |
 
-### Run on a Single PR
+## Alternative: Dev Container
 
-```bash
-cd PatchGuru
-
-# Phase 1 + DIVE Phase 2
-PATCHGURU_PHASE2_STRATEGY=dive \
-  uv run python -m patchguru.SpecInfer --project marshmallow --pr_nb 707
-```
-
-### Batch Evaluation
-
-```bash
-cd PatchGuru
-
-# 1. Set up target project environments (once per project)
-bash scripts/setup_env.sh pandas
-
-# 2. Expand to N parallel workers
-NB_CLONES=10 bash scripts/expand_clones.sh pandas
-
-# 3. Run batch with DIVE
-NB_CLONES=10 WORKERS=10 bash scripts/watch_and_run.sh pandas scipy keras marshmallow
-# Or directly:
-uv run python scripts/run_all_specinfer.py \
-  --projects pandas scipy keras marshmallow \
-  --workers 10 --nb-clones 10 \
-  --phase2-strategy dive \
-  --cache-dir .cache_dive
-```
-
-### DIVE Configuration
-
-Set via environment variables (see `PatchGuru/patchguru/Config.py`):
-
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PATCHGURU_PHASE2_STRATEGY` | `baseline` | Set to `dive` to enable DIVE |
-| `PATCHGURU_DIVE_EXEC_BUDGET` | `800` | Max executions per PR |
-| `PATCHGURU_DIVE_TIME_BUDGET_SEC` | `300` | Wall-clock budget inside container |
-| `PATCHGURU_DIVE_SEED_BASELINE_DIR` | — | Optional baseline cache for seed fusion |
-| `PATCHGURU_DIVE_ABLATION` | `none` | Ablation: `no_constructor`, `no_guided`, `no_triage`, `search_only` |
-
-Results are written to `<cache-dir>/oracles/<project>/<pr>/phase2/results.json`.
-
-## Paper
-
-The LaTeX draft lives in [`paper/`](paper/). Build with:
-
-```bash
-cd paper && make
-```
-
-Evaluation numbers and experiment progress are tracked in [`paper/experiment-status.md`](paper/experiment-status.md).
-
-## Baselines
-
-| Tool | Location | Role |
-|------|----------|------|
-| PatchGuru | [`PatchGuru/`](PatchGuru/) | Host pipeline + one-shot baseline (Phase 2) |
-| Testora | [`Testora/`](Testora/) | External intent-based detector for comparison |
-
-## Citation
-
-If you use DIVE in your research, please cite our paper (BibTeX to be added upon publication).
+Both PatchGuru and Testora support VS Code Dev Containers (`.devcontainer/`). Open the subfolder in VS Code → **Dev Containers: Rebuild and Reopen in Container**. This builds PatchGuru/Testora plus in-container target-project instances. Host-side `scripts/setup_env.sh` is the recommended path for large batch runs.
 
 ## License
 
-- DIVE extensions in `PatchGuru/` inherit the [Apache License 2.0](PatchGuru/LICENSE) from PatchGuru.
-- `Testora/` is under the [MIT License](Testora/LICENSE).
+- DIVE extensions in `PatchGuru/`: [Apache License 2.0](PatchGuru/LICENSE)
+- `Testora/`: [MIT License](Testora/LICENSE)
