@@ -1,0 +1,23 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "Testora"
+version = "0.1.0"
+description = ""
+authors = [
+    { name = "Michael Pradel", email = "michael@binaervarianz.de" }
+]
+license = "MIT"
+dependencies = []
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/testora",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+]

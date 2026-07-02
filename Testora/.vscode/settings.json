@@ -1,0 +1,9 @@
+{
+    "mypy.runUsingActiveInterpreter": true,
+    "mypy.targets": [
+        "src"
+    ],
+    "files.watcherExclude": {
+        "data/**": true,
+    }
+}

@@ -1,0 +1,7 @@
+# Local git backups from nested repositories
+.patchguru.git.bak/
+.testora.git.bak/
+
+# Target-project clones (generated at runtime)
+clones/
+clones_pgabl/
